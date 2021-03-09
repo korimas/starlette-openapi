@@ -1,6 +1,6 @@
 from starlette.responses import JSONResponse
 from starlette.applications import Starlette
-from starlette_pydantic import PydanticEndpoint
+from starlette_pydantic import PydanticEndpoint, BaseForm
 from pydantic import BaseModel
 from pydantic.schema import get_model_name_map, schema
 import simplejson
@@ -57,7 +57,7 @@ class OpenApiData(OpenApiObj):
     def __init__(self, openapi, info, paths, components=None):
         self.openapi = openapi or "3.0.3"
         self.info = info
-        self.servers = []
+        self.servers = None
         self.paths = paths
         self.components = components
         self.security = []
@@ -75,6 +75,20 @@ class OpenApiInfo(OpenApiObj):
         self.contact = contact
         self.license = license
         self.version = version
+
+
+class OpenApiSecuritySchema(OpenApiObj):
+    fixed_fields = ["type", "description", "name", "location_in", "scheme", "bearerFormat", "flows", "openIdConnectUrl"]
+
+    def __init__(self):
+        self.type = None
+        self.description = None
+        self.name = None
+        self.location_in = None
+        self.schema = None
+        self.bearerFormat = None
+        self.flows = None
+        self.openIdConnectUrl = None
 
 
 class OpenApiComponents(OpenApiObj):
@@ -95,20 +109,24 @@ class OpenApiComponents(OpenApiObj):
     def set_schemas(self, schemas: dict):
         self.schemas = schemas
 
+    def add_security_schemas(self, name, security_schema: OpenApiSecuritySchema):
+        self.securitySchemes[name] = security_schema
 
-class OpenApiParameter(OpenApiObj):
-    fixed_fields = ['name', 'location_in', 'description', 'required', 'deprecated', 'allowEmptyValue']
 
-    def __init__(self, name, location_in, required, description=None, deprecated=False, allowEmptyValue=False):
+class OpenApiOperationParameter(OpenApiObj):
+    fixed_fields = ['name', 'location_in', 'description', 'required', 'deprecated', 'allowEmptyValue', 'type']
+
+    def __init__(self, name, location_in, required, description=None, deprecated=None, allowEmptyValue=None):
         self.name = name
         self.location_in = location_in
         self.required = required
         self.description = description
         self.deprecated = deprecated
         self.allowEmptyValue = allowEmptyValue
+        self.type = None
 
 
-class OpenApiRequestBody(OpenApiObj):
+class OpenApiOperationRequest(OpenApiObj):
     fixed_fields = ['description', 'required', 'content']
 
     def __init__(self, required=True, description=None):
@@ -124,7 +142,7 @@ class OpenApiRequestBody(OpenApiObj):
             self.content[media_type]['examples'] = examples
 
 
-class OpenApiResponse(OpenApiObj):
+class OpenApiOperationResponse(OpenApiObj):
     fixed_fields = ['description', 'headers', 'content', 'links']
 
     def __init__(self, description, headers=None, content=None, links=None):
@@ -141,9 +159,19 @@ class OpenApiResponse(OpenApiObj):
             self.content[media_type]['examples'] = examples
 
 
+class OpenApiOperationSeucirty(OpenApiObj):
+
+    def __init__(self, name, scopes=None):
+        self.name = name
+        self.scopes = scopes or []
+
+    def dict(self):
+        return {self.name: self.scopes}
+
+
 class OpenApiOperation(OpenApiObj):
-    fixed_fields = ['tags', 'summary', 'description', 'externalDocs', 'operationId', 'parameters', 'requestBody',
-                    'responses', 'callbacks', 'deprecated', 'security', 'servers']
+    fixed_fields = ['tags', 'consumes', 'produces', 'summary', 'description', 'externalDocs', 'operationId',
+                    'parameters', 'requestBody', 'responses', 'callbacks', 'deprecated', 'security', 'servers']
 
     def __init__(self):
         self.tags = []
@@ -157,15 +185,20 @@ class OpenApiOperation(OpenApiObj):
         self.callbacks = None
         self.deprecated = False
         self.security = []
-        self.servers = []
+        self.servers = None
+        self.consumes = None
+        self.produces = None
 
-    def add_parameters(self, parameter: OpenApiParameter):
+    def add_parameters(self, parameter: OpenApiOperationParameter):
         self.parameters.append(parameter)
 
-    def add_response(self, status_code, response: OpenApiResponse):
+    def add_response(self, status_code, response: OpenApiOperationResponse):
         self.responses[str(status_code)] = response
 
-    def set_request_body(self, request_body: OpenApiRequestBody):
+    def add_security(self, security: OpenApiOperationSeucirty):
+        self.security.append(security)
+
+    def set_request_body(self, request_body: OpenApiOperationRequest):
         self.requestBody = request_body
 
 
@@ -178,8 +211,8 @@ class OpenApiPath(OpenApiObj):
         self.ref = None
         self.summary = None
         self.description = None
-        self.servers = []
-        self.parameters = []
+        self.servers = None
+        self.parameters = None
 
     def add_operation(self, method, operation):
         setattr(self, method, operation)
@@ -211,6 +244,8 @@ class OpenApi(object):
 
         self.api_schemas = None
         self.components = []
+        self.securitySchemas_index = {}
+        self.token_url = None
         self.models_name = None
 
         self.app.add_route(self.api_url, self.get_openapi_data, include_in_schema=False)
@@ -232,8 +267,11 @@ class OpenApi(object):
                 handler = getattr(endpoint, method)
                 method_annotations = handler.__annotations__
                 for ann_name, ann in method_annotations.items():
-                    if isinstance(ann, type) and issubclass(ann, BaseModel):
-                        models.add(ann)
+                    if isinstance(ann, type):
+                        if issubclass(ann, BaseModel):
+                            models.add(ann)
+                        if issubclass(ann, BaseForm):
+                            models.add(ann.model_cls)
 
         model_names = get_model_name_map(models)
         return model_names
@@ -244,22 +282,39 @@ class OpenApi(object):
         method_annotations = handler.__annotations__
         for ann_name, ann in method_annotations.items():
             if ann_name == "return":
-                response = OpenApiResponse(description="Success Response")
+                response = OpenApiOperationResponse(description="Success Response")
                 response.add_schema_content("application/json", self.models_name[ann])
                 operation.add_response(200, response)
 
             elif ann_name == "body":
-                request_body = OpenApiRequestBody()
+                request_body = OpenApiOperationRequest()
                 request_body.add_schema_content("application/json", self.models_name[ann])
                 operation.set_request_body(request_body)
 
+            elif ann_name == "form":
+                request_body = OpenApiOperationRequest()
+                request_body.add_schema_content("multipart/form-data", self.models_name[ann.model_cls])
+                operation.set_request_body(request_body)
+
             elif ann_name in route.param_convertors:
-                parameter = OpenApiParameter(name=ann_name, location_in='path', required=True)
+                parameter = OpenApiOperationParameter(name=ann_name, location_in='path', required=True)
                 operation.add_parameters(parameter)
 
             else:
-                parameter = OpenApiParameter(name=ann_name, location_in='query', required=False)
+                parameter = OpenApiOperationParameter(name=ann_name, location_in='query', required=False)
                 operation.add_parameters(parameter)
+
+        if hasattr(handler, 'auth_dict'):
+            auth_dict = handler.auth_dict
+            if auth_dict.get('auth_require'):
+                operation.add_security(OpenApiOperationSeucirty(auth_dict['name']))
+                if not auth_dict['name'] in self.securitySchemas_index:
+                    self.securitySchemas_index[auth_dict['name']] = auth_dict
+
+            elif auth_dict.get('token_url'):
+                self.token_url = route.path
+
+            del handler.auth_dict
 
         return operation
 
@@ -289,6 +344,18 @@ class OpenApi(object):
         model_list = list(self.models_name.keys())
         schemas = schema(model_list, title='Pydantic_Schemas')['definitions']
         components.set_schemas(schemas)
+
+        for name, security_dict in self.securitySchemas_index.items():
+            security_schema = OpenApiSecuritySchema()
+            security_schema.type = security_dict['auth_type']
+            security_schema.flows = {
+                "password": {
+                    "scopes": {},
+                    "tokenUrl": self.token_url
+                }
+            }
+            components.add_security_schemas(name, security_schema)
+
         return components
 
     def get_openapi_data(self, request):
